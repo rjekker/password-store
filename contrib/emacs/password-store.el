@@ -33,10 +33,18 @@
 
 ;; https://www.passwordstore.org/
 
+;; To enable the standard behaviour, load this library and
+;; call password-store-enable, like this:
+
+;; (require 'password-store)
+;; (password-store-enable)
+
 ;;; Code:
 
 (require 'with-editor)
 (require 'auth-source-pass)
+(require 'vc)
+(require 'epa)
 
 (defgroup password-store '()
   "Emacs mode for password-store.
@@ -69,6 +77,18 @@ Don't forget to mention your Emacs and library versions.")))
   :group 'password-store
   :type 'string)
 
+(defcustom password-store-edit-auto-commit t
+  "Automatically commit edited password files to version control."
+  :group 'password-store
+  :type 'boolean)
+
+(defcustom password-store-menu-key "C-c p"
+  "Key to bind to the password-store-menu command.
+
+This is used by the password-store-enable command."
+  :group 'password-store
+  :type 'key)
+
 (defvar password-store-executable
   (executable-find "pass")
   "Pass executable.")
@@ -82,7 +102,7 @@ Don't forget to mention your Emacs and library versions.")))
 This function just returns
 `password-store-time-before-clipboard-restore'.  Kept for
 backward compatibility with other libraries."
-password-store-time-before-clipboard-restore)
+  password-store-time-before-clipboard-restore)
 
 (make-obsolete 'password-store-timeout 'password-store-time-before-clipboard-restore "2.0.4")
 
@@ -342,7 +362,7 @@ Separate multiple IDs with spaces."
 ;;;###autoload
 (defun password-store-insert (entry password)
   "Insert a new ENTRY containing PASSWORD."
-  (interactive (list (password-store--completing-read)
+  (interactive (list (password-store--completing-read-new-entry)
                      (read-passwd "Password: " t)))
   (let* ((command (format "echo %s | %s insert -m -f %s"
                           (shell-quote-argument password)
@@ -353,6 +373,68 @@ Separate multiple IDs with spaces."
         (message "Successfully inserted entry for %s" entry)
       (message "Cannot insert entry for %s" entry))
     nil))
+
+;;;###autoload
+(defun password-store-insert-multiline (entry)
+  (interactive (list (password-store--completing-read-new-entry)))
+  (when entry
+    (ignore-errors
+      (kill-buffer password-store--insert-buffer-name t))
+    (let ((buffer (get-buffer-create password-store--insert-buffer-name)))
+      (message "%s ""Please insert text for new pass entry, then press `C-c C-c' to save, or `C-c C-k' to cancel.")
+      (with-current-buffer buffer
+        (password-store-insert-mode)
+        (setq-local password-store-new-entry entry))
+      (pop-to-buffer buffer)
+      "")))
+
+(defun password-store--insert-save ()
+  (interactive)
+  (with-current-buffer (get-buffer password-store--insert-buffer-name)
+    (password-store-insert password-store-new-entry (buffer-string)))
+  (password-store--kill-insert-buffer t))
+
+(defun password-store--commit-on-save ()
+  (when password-store-edit-auto-commit
+    (when-let ((backend (vc-responsible-backend (password-store-dir) t)))
+      (let ((entry (password-store--file-to-entry (buffer-file-name))))
+        (when (not (vc-registered (buffer-file-name)))
+          (vc-register))
+        (vc-call-backend backend 'checkin (list buffer-file-name)
+                         (format "Edit password for %s using Emacs" entry) nil)))))
+
+(define-derived-mode password-store-edit-mode text-mode "pass-edit"
+  "Major mode for editing password-store entries, which auto-commits changes."
+  (add-hook 'after-save-hook 'password-store--commit-on-save nil t))
+
+(defvar-keymap password-store-insert-mode-map
+  :parent text-mode-map
+  "C-c C-c" #'password-store--insert-save
+  "C-c C-k" #'password-store--kill-insert-buffer)
+
+(defun password-store--maybe-edit-mode ()
+  "Start pass-edit mode, but only when we are in the password store"
+  (when (file-in-directory-p (buffer-file-name) (password-store-dir))
+    (password-store-edit-mode)))
+
+(define-derived-mode password-store-insert-mode text-mode "pass-insert"
+  "Major mode for editing new password-store entries."
+  (setq buffer-offer-save nil))
+
+(defun password-store--kill-insert-buffer (&optional force)
+  (interactive)
+  (when (or force
+            (yes-or-no-p "Cancel new pass entry?"))
+    (kill-buffer password-store--insert-buffer-name)))
+
+(defun password-store--completing-read-new-entry ()
+  "Prompt for name of new pass entry, ask confirmation if it exists"
+  (let*
+      ((entry (password-store--completing-read))
+       (exists (file-exists-p (password-store--entry-to-file entry))))
+    (when (or (not exists)
+              (yes-or-no-p (format "Overwrite entry %s?" entry)))
+      entry)))
 
 ;;;###autoload
 (defun password-store-generate (entry &optional password-length)
@@ -414,6 +496,138 @@ Default PASSWORD-LENGTH is `password-store-password-length'."
     (if url (browse-url url)
       (error "Field `%s' not found" password-store-url-field))))
 
+;;;###autoload
+(defun password-store-view (entry)
+  "Show the contents of the selected password file ENTRY."
+  (interactive (list (password-store--completing-read)))
+  (view-file (password-store--entry-to-file entry)))
+
+;;;###autoload
+(defun password-store-browse-and-copy (entry)
+  "Browse ENTRY using `password-store-url', and copy the secret to the kill ring."
+  (interactive (list (password-store--completing-read)))
+  (password-store-copy entry)
+  (password-store-url entry))
+
+;;;###autoload
+(defun password-store-dired ()
+  "Open the password store directory in dired,"
+  (interactive)
+  (dired (password-store-dir)))
+
+;;;###autoload
+(defun password-store-visit (entry)
+  "Visit file for ENTRY,"
+  (interactive (list (password-store--completing-read)))
+  (with-current-buffer
+      (find-file (password-store--entry-to-file entry))
+    (password-store-edit-mode)))
+
+;;;###autoload
+(defun password-store-pull ()
+  (interactive)
+  (let ((default-directory (password-store-dir)))
+    (vc-pull)))
+
+;;;###autoload
+(defun password-store-push ()
+  (interactive)
+  (let ((default-directory (password-store-dir)))
+    (vc-push)))
+
+;;;###autoload
+(defun password-store-diff ()
+  (interactive)
+  (vc-dir (password-store-dir)))
+
+(when (require 'transient nil 'noerror)
+  (transient-define-suffix password-store--generate-run-transient
+    (entry &optional password-length)
+    "Generate a new password for ENTRY with PASSWORD-LENGTH.
+
+Default PASSWORD-LENGTH is `password-store-password-length'."
+    (interactive (list (password-store--completing-read)
+                       (and current-prefix-arg
+                            (abs (prefix-numeric-value current-prefix-arg)))))
+    (let* ((transient-length-arg nil)
+           (args (dolist
+                     ;; filter length out of the argument list
+                     (arg (transient-args transient-current-command))
+                   (if (string-prefix-p "--" arg)
+                       (push arg args)
+                     (setq transient-length-arg arg)))))
+      (push entry args)
+      ;; for the value of length, prefix argument takes precedence over transient arg
+      (push (format "%s"
+                    (or password-length transient-length-arg password-store-password-length)) args)
+      (apply #'password-store--run "generate" (nreverse args))))
+
+  (defun password-store--read-length (prompt initial-input history)
+    "Read a number for the password length, or return default if input empty."
+    (let ((input (transient--read-number-N prompt initial-input history nil)))
+      (if (string-equal input "")
+          (int-to-string password-store-password-length)
+        input)))
+  
+  (transient-define-infix password-store-generate:length ()
+    "Password length: should always be set."
+    :argument ""
+    :key "l"
+    :prompt "Password length: "
+    :multi-value nil
+    :always-read t
+    :description "Length"
+    :class 'transient-option
+    :reader #'password-store--read-length)
+  
+  (transient-define-prefix password-store-generate-transient ()
+    "Generate new password using transient"
+    :value `(nil nil nil ,(int-to-string password-store-password-length))
+    [
+     ("i" "In place" "--in-place")
+     ("f" "Force overwrite" "--force")
+     ("n" "No symbols" "--no-symbols")
+     (password-store-generate:length)
+     ("g" "Generate" password-store--generate-run-transient)])
+
+  (defconst password-store--insert-buffer-name "*password-store-insert*")
+
+  (transient-define-prefix password-store-menu ()
+    "Entry point for password store actions."
+    ["Password Entry"
+     ["Use"
+      ("b" "Browse" password-store-url)
+      ("c" "Copy Secret" password-store-copy)
+      ("f" "Copy Field" password-store-copy-field)
+      ("o" "Browse and copy" password-store-browse-and-copy)
+      ("v" "View" password-store-view)
+      ]
+     ["Change"
+      ("D" "Delete" password-store-remove)
+      ("e" "Edit (visit file)" password-store-visit)
+      ("E" "Edit (pass command)" password-store-edit)
+      ("i" "Insert password" password-store-insert)
+      ("I" "Insert multiline" password-store-insert-multiline)
+      ("g" "generate" password-store-generate-transient :transient transient--do-exit)
+      ("r" "Rename" password-store-rename)
+      ]
+     ["VC" :if (lambda () (vc-responsible-backend (password-store-dir) t))
+      ("=" "Diff" password-store-diff)
+      ("p" "Pull" password-store-pull)
+      ("P" "Push" password-store-push)
+      ]
+     ["Store"
+      ("d" "Dired" password-store-dired)
+      ]]
+    [("!" "Clear secret from kill ring" password-store-clear)
+     ]
+    ))
+
+(defun password-store-enable ()
+  "Run this to setup auto-mode-alist and keybinding for password-store."
+  (interactive)
+  (add-to-list 'auto-mode-alist (cons epa-file-name-regexp 'password-store--maybe-edit-mode))
+  (define-key global-map (kbd password-store-menu-key) #'password-store-menu))
 
 (provide 'password-store)
 
